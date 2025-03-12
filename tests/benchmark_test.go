@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -153,6 +154,9 @@ func TestProgressLogger(t *testing.T) {
 		t.Fatalf("Failed to write test file: %v", err)
 	}
 
+	// Temporarily disable test mode to see actual progress output
+	SetTestMode(false)
+
 	// Redirect stdout to capture progress output
 	oldStdout := os.Stdout
 	r, w, _ := os.Pipe()
@@ -172,6 +176,9 @@ func TestProgressLogger(t *testing.T) {
 	w.Close()
 	os.Stdout = oldStdout
 
+	// Restore test mode
+	SetTestMode(true)
+
 	// Read stdout and verify progress was reported
 	outBytes := make([]byte, 1024)
 	n, _ := r.Read(outBytes)
@@ -188,14 +195,39 @@ func TestProgressLogger(t *testing.T) {
 		t.Fatalf("No progress output detected")
 	}
 
-	// Verify that some progress percentage was reported
-	progressMarker := "Processed"
-	if !containsSubstring(output, progressMarker) {
-		t.Fatalf("Progress output doesn't contain expected text '%s': %s", progressMarker, output)
+	// Verify that human-readable progress was reported
+	if !strings.Contains(output, "Starting processing") {
+		t.Fatalf("Progress output doesn't contain expected text 'Starting processing': %s", output)
 	}
-}
 
-// Helper function to check if string contains substring
-func containsSubstring(s, substr string) bool {
-	return len(s) >= len(substr) && s[:len(substr)] == substr
+	// Also test the test mode format
+	r2, w2, _ := os.Pipe()
+	os.Stdout = w2
+
+	// Compress again with test mode enabled
+	go func() {
+		done <- Compress(testFile, compressedFile+".2")
+	}()
+
+	// Wait a bit for test mode progress logger to run
+	time.Sleep(1500 * time.Millisecond)
+
+	// Capture and restore
+	w2.Close()
+	os.Stdout = oldStdout
+
+	outBytes2 := make([]byte, 1024)
+	n2, _ := r2.Read(outBytes2)
+	testOutput := string(outBytes2[:n2])
+
+	// Check the error
+	err = <-done
+	if err != nil {
+		t.Fatalf("Test mode compression failed: %v", err)
+	}
+
+	// Check test mode output
+	if !strings.Contains(testOutput, "[TEST]") {
+		t.Fatalf("Test mode output doesn't contain expected '[TEST]' marker: %s", testOutput)
+	}
 }

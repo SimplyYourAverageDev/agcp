@@ -12,6 +12,15 @@ import (
 	"testing"
 )
 
+// TestMain sets up the environment for all tests
+func TestMain(m *testing.M) {
+	// Enable test mode for progress reporting
+	SetTestMode(true)
+
+	// Run tests and exit with returned code
+	os.Exit(m.Run())
+}
+
 // TestCompressDecompressFile tests the compression and decompression of a single file
 func TestCompressDecompressFile(t *testing.T) {
 	// Create a temporary directory for testing

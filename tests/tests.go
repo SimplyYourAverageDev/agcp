@@ -5,6 +5,7 @@ package tests
 
 import (
 	"agcp/lib"
+	"agcp/pkg/progress" // Import the progress package
 )
 
 var (
@@ -20,3 +21,8 @@ var (
 	ArchiveFile = lib.ArchiveFile
 	ArchiveDir  = lib.ArchiveDir
 )
+
+// SetTestMode enables or disables test mode for progress output
+func SetTestMode(enabled bool) {
+	progress.SetTestMode(enabled)
+}
