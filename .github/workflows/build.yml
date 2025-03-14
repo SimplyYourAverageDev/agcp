@@ -159,15 +159,21 @@ jobs:
                 continue
               fi
               
-              # Use the directory name directly as the filename
-              echo "Uploading $dir_name..."
+              # Add .exe extension for Windows builds
+              if [[ "$dir_name" == *"windows"* ]]; then
+                upload_name="${dir_name}.exe"
+              else
+                upload_name="${dir_name}"
+              fi
+              
+              echo "Uploading $upload_name..."
               
               # Upload asset with error handling
-              if ! curl -XPOST "$UPLOAD_URL?name=$dir_name" \
+              if ! curl -XPOST "$UPLOAD_URL?name=$upload_name" \
                    -H "Authorization: token $GITHUB_TOKEN" \
                    -H "Content-Type: application/octet-stream" \
                    --data-binary @"$asset"; then
-                echo "Failed to upload $dir_name"
+                echo "Failed to upload $upload_name"
                 exit 1
               fi
             done
