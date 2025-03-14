@@ -140,7 +140,11 @@ jobs:
           
           if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
             echo "Failed to get upload URL from create_release outputs."
+            exit 1  # Exit with error if upload URL is invalid
           fi
+          
+          # Remove template parameters from URL if present
+          UPLOAD_URL=$(echo "$UPLOAD_URL" | sed 's/{?.*}//')
           
           echo "Upload URL: $UPLOAD_URL"
           
@@ -154,11 +158,11 @@ jobs:
             filename=$(basename "$asset")
             echo "Uploading $filename..."
             
-            # Add error handling for upload
+            # Upload asset with error handling
             if ! curl -XPOST "$UPLOAD_URL?name=$filename" \
-                     -H "Authorization: token $GITHUB_TOKEN" \
-                     -H "Content-Type: application/octet-stream" \
-                     --data-binary @"$asset"; then
+                 -H "Authorization: token $GITHUB_TOKEN" \
+                 -H "Content-Type: application/octet-stream" \
+                 --data-binary @"$asset"; then
               echo "Failed to upload $filename"
               exit 1
             fi
