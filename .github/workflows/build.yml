@@ -45,12 +45,12 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
-        go-version: '1.21'
+        go-version: '1.21.4'
 
     - name: Go Version Check
       run: go version
@@ -80,33 +80,41 @@ jobs:
         (matrix.os == 'darwin' && runner.os == 'macOS')
       run: go test -v ./...
 
+    - name: Verify Build Output
+      run: |
+        if [ ! -f ./agcp${{ matrix.extension }} ]; then
+          echo "Build output not found: agcp${{ matrix.extension }}"
+          exit 1
+        fi
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: agcp-${{ matrix.os }}-${{ matrix.arch }}
         path: ./agcp${{ matrix.extension }}
-        if-no-files-found: warn  # Changed from error to warn to prevent workflow failure
+        if-no-files-found: error
+        compression-level: 0  # Disable compression for binary files
 
-  # Create a release when a tag is pushed
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          compression-level: 0  # Ensure no compression during download
 
       - name: List downloaded artifacts (Debug)
         run: |
           find artifacts -type f | sort
           # Make Linux/macOS binaries executable
           find artifacts -name "agcp" -type f -exec chmod +x {} \;
-          
+
       - name: Create Release
         id: create_release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/agcp-windows-amd64/agcp.exe
@@ -115,6 +123,6 @@ jobs:
             artifacts/agcp-linux-arm64/agcp
             artifacts/agcp-darwin-amd64/agcp
             artifacts/agcp-darwin-arm64/agcp
-          name: Release ${{ github.ref_name }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('Build {0}', github.sha) }}
           draft: false
-          prerelease: false 
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}  # Mark as prerelease if not from a tag
