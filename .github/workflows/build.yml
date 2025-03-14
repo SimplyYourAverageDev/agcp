@@ -125,15 +125,27 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          files: |
-            artifacts/agcp-windows-amd64/agcp.exe
-            artifacts/agcp-windows-arm64/agcp.exe
-            artifacts/agcp-linux-amd64/agcp
-            artifacts/agcp-linux-arm64/agcp
-            artifacts/agcp-darwin-amd64/agcp
-            artifacts/agcp-darwin-arm64/agcp
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('Build {0}', github.sha) }}
           draft: false
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.sha) }}
           generate_release_notes: true
+
+      - name: Upload Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the upload URL from the release
+          UPLOAD_URL=$(curl -H "Authorization: token $GITHUB_TOKEN" \
+                          -H "Accept: application/vnd.github.v3+json" \
+                          https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.create_release.outputs.tag_name }} | jq -r '.upload_url' | cut -d'{' -f1)
+          
+          # Upload each asset
+          for asset in artifacts/agcp-*/agcp*; do
+            filename=$(basename "$asset")
+            echo "Uploading $filename..."
+            curl -XPOST "$UPLOAD_URL?name=$filename" \
+                 -H "Authorization: token $GITHUB_TOKEN" \
+                 -H "Content-Type: application/octet-stream" \
+                 --data-binary @"$asset"
+          done
