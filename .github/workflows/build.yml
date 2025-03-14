@@ -148,7 +148,7 @@ jobs:
           
           echo "Upload URL: $UPLOAD_URL"
           
-          # Upload each asset with platform-specific names
+          # Upload each asset with clean platform-specific names
           for asset_dir in artifacts/agcp-*; do
             platform=$(basename "$asset_dir")
             for asset in "$asset_dir"/agcp*; do
@@ -157,11 +157,8 @@ jobs:
                 continue
               fi
               
-              # Get base filename
-              base_filename=$(basename "$asset")
-              
-              # Create platform-specific filename
-              platform_filename="$platform-$base_filename"
+              # Create clean platform-specific filename (without redundant "agcp" in name)
+              platform_filename="agcp-$platform"
               echo "Uploading $platform_filename..."
               
               # Upload asset with error handling
