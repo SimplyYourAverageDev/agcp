@@ -5,7 +5,7 @@ package tests
 
 import (
 	"agcp/lib"
-	"agcp/pkg/progress" // Import the progress package
+	"agcp/pkg/progress"
 )
 
 var (
