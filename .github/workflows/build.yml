@@ -59,7 +59,10 @@ jobs:
         go build -v -o agcp${{ matrix.extension }}
 
     - name: Test
-      if: matrix.os == runner.os
+      if: >-
+        (matrix.os == 'windows' && runner.os == 'Windows') ||
+        (matrix.os == 'linux' && runner.os == 'Linux') ||
+        (matrix.os == 'darwin' && runner.os == 'macOS')
       run: go test -v ./...
 
     - name: Upload artifact
