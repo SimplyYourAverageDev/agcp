@@ -122,6 +122,8 @@ jobs:
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: |
             artifacts/agcp-windows-amd64/agcp.exe
@@ -132,5 +134,6 @@ jobs:
             artifacts/agcp-darwin-arm64/agcp
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('Build {0}', github.sha) }}
           draft: false
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}  # Mark as prerelease if not from a tag
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.sha) }}
+          generate_release_notes: true
