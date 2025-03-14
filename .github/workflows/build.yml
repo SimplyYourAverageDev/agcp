@@ -150,23 +150,24 @@ jobs:
           
           # Upload each asset with clean platform-specific names
           for asset_dir in artifacts/agcp-*; do
-            platform=$(basename "$asset_dir")
+            # Get the platform part from directory name
+            dir_name=$(basename "$asset_dir")
+            
             for asset in "$asset_dir"/agcp*; do
               if [ ! -f "$asset" ]; then
                 echo "Asset not found: $asset"
                 continue
               fi
               
-              # Create clean platform-specific filename (without redundant "agcp" in name)
-              platform_filename="agcp-$platform"
-              echo "Uploading $platform_filename..."
+              # Use the directory name directly as the filename
+              echo "Uploading $dir_name..."
               
               # Upload asset with error handling
-              if ! curl -XPOST "$UPLOAD_URL?name=$platform_filename" \
+              if ! curl -XPOST "$UPLOAD_URL?name=$dir_name" \
                    -H "Authorization: token $GITHUB_TOKEN" \
                    -H "Content-Type: application/octet-stream" \
                    --data-binary @"$asset"; then
-                echo "Failed to upload $platform_filename"
+                echo "Failed to upload $dir_name"
                 exit 1
               fi
             done
