@@ -135,18 +135,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get the upload URL from the release
-          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-                          -H "Accept: application/vnd.github.v3+json" \
-                          https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.create_release.outputs.tag_name }})
-          
-          # Extract and validate upload URL
-          UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url' | cut -d'{' -f1)
+          # Get the upload URL directly from the create_release step outputs
+          UPLOAD_URL="${{ steps.create_release.outputs.upload_url }}"
           
           if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
-            echo "Failed to get upload URL. Response:"
-            echo "$RESPONSE"
-            exit 1
+            echo "Failed to get upload URL from create_release outputs."
           fi
           
           echo "Upload URL: $UPLOAD_URL"
