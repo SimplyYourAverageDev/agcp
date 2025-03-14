@@ -58,8 +58,12 @@ jobs:
       run: |
         go build -v -o agcp${{ matrix.extension }}
 
-    - name: List built files
-      run: ls -alh .
+    - name: List build directory (Debug)
+      shell: bash
+      run: |
+        ls -la
+        echo "Current directory: $(pwd)"
+        echo "Looking for: agcp${{ matrix.extension }}"
 
     - name: Test
       if: >-
@@ -72,7 +76,8 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         name: agcp-${{ matrix.os }}-${{ matrix.arch }}
-        path: ./agcp${{ matrix.extension }}
+        path: agcp${{ matrix.extension }}
+        if-no-files-found: error
 
   # Create a release when a tag is pushed
   release:
@@ -85,6 +90,10 @@ jobs:
         with:
           path: artifacts
 
+      - name: List downloaded artifacts (Debug)
+        run: |
+          find artifacts -type f | sort
+          
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
