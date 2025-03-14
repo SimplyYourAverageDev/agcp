@@ -81,10 +81,18 @@ jobs:
       run: go test -v ./...
 
     - name: Verify Build Output
+      shell: bash
       run: |
-        if [ ! -f ./agcp${{ matrix.extension }} ]; then
-          echo "Build output not found: agcp${{ matrix.extension }}"
-          exit 1
+        if [ "${{ matrix.os }}" = "windows" ]; then
+          if [ ! -f ./agcp.exe ]; then
+            echo "Build output not found: agcp.exe"
+            exit 1
+          fi
+        else
+          if [ ! -f ./agcp ]; then
+            echo "Build output not found: agcp"
+            exit 1
+          fi
         fi
 
     - name: Upload artifact
