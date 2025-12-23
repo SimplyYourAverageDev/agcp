@@ -12,88 +12,114 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
-// Compress handles the compression process for files or directories
+// Compressor handles file and directory compression
+type Compressor struct {
+	bufferPool *BufferPool
+}
+
+// NewCompressor creates a new Compressor with default settings
+func NewCompressor() *Compressor {
+	return &Compressor{
+		bufferPool: defaultBufferPool,
+	}
+}
+
+// Compress compresses a file or directory to the specified output path
 func Compress(input, output string) error {
+	return NewCompressor().Compress(input, output)
+}
+
+// Compress performs the compression operation
+func (c *Compressor) Compress(input, output string) error {
 	info, err := os.Stat(input)
 	if err != nil {
 		return fmt.Errorf("stat input: %w", err)
 	}
 
-	var archiveType ArchiveType
-	var rootName string
-	var entries []Entry
-	if info.IsDir() {
-		archiveType = ArchiveDir
-		rootName = filepath.Base(input)
-		entries, err = collectDirEntries(input)
-		if err != nil {
-			return fmt.Errorf("collect entries: %w", err)
-		}
-	} else {
-		archiveType = ArchiveFile
-		rootName = filepath.Base(input)
-		entries = []Entry{{RelPath: "", FilePath: input}}
+	archiveType, rootName, entries, err := c.collectEntries(input, info)
+	if err != nil {
+		return err
 	}
 
-	// Calculate total size for progress
-	totalSize := calculateTotalSize(entries)
+	totalSize := c.calculateTotalSize(entries)
 	progress.Init(totalSize)
 	defer progress.Stop()
 
-	return compressFiles(entries, output, archiveType, rootName)
+	return c.writeArchive(entries, output, archiveType, rootName)
 }
 
-// calculateTotalSize calculates the total size of all files to be compressed
-func calculateTotalSize(entries []Entry) uint64 {
-	var totalSize uint64
-	for _, entry := range entries {
-		info, err := os.Stat(entry.FilePath)
+// collectEntries gathers all files to be compressed
+func (c *Compressor) collectEntries(input string, info os.FileInfo) (ArchiveType, string, []Entry, error) {
+	rootName := filepath.Base(input)
+
+	if info.IsDir() {
+		entries, err := c.walkDirectory(input)
 		if err != nil {
-			continue
+			return ArchiveDir, "", nil, fmt.Errorf("collect entries: %w", err)
 		}
-		totalSize += uint64(info.Size())
+		return ArchiveDir, rootName, entries, nil
 	}
-	if totalSize == 0 {
-		totalSize = 1 // Avoid division by zero
+
+	// Single file
+	entry := Entry{
+		RelPath:  "",
+		FilePath: input,
+		Size:     info.Size(),
 	}
-	return totalSize
+	return ArchiveFile, rootName, []Entry{entry}, nil
 }
 
-// collectDirEntries gathers all files in a directory with relative paths
-func collectDirEntries(root string) ([]Entry, error) {
+// walkDirectory recursively collects all files in a directory
+func (c *Compressor) walkDirectory(root string) ([]Entry, error) {
 	var entries []Entry
+
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() {
-			relPath, err := filepath.Rel(root, path)
-			if err != nil {
-				return fmt.Errorf("relative path for %s: %w", path, err)
-			}
-			entries = append(entries, Entry{RelPath: relPath, FilePath: path})
+
+		if info.IsDir() {
+			return nil
 		}
+
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("relative path for %s: %w", path, err)
+		}
+
+		entries = append(entries, Entry{
+			RelPath:  relPath,
+			FilePath: path,
+			Size:     info.Size(),
+		})
 		return nil
 	})
+
 	if err != nil {
 		return nil, fmt.Errorf("walk directory %s: %w", root, err)
 	}
+
 	return entries, nil
 }
 
-// compressFiles compresses files using LZ4 streaming and writes to the archive
-func compressFiles(entries []Entry, output string, archiveType ArchiveType, rootName string) error {
-	// Clean up existing output file
-	if _, err := os.Stat(output); err == nil {
-		if err := os.Remove(output); err != nil {
-			return fmt.Errorf("remove existing output: %w", err)
+// calculateTotalSize computes the total size of all entries
+func (c *Compressor) calculateTotalSize(entries []Entry) uint64 {
+	var total uint64
+	for i := range entries {
+		if entries[i].Size > 0 {
+			total += uint64(entries[i].Size)
 		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("check output existence: %w", err)
 	}
+	if total == 0 {
+		total = 1 // Avoid division by zero in progress
+	}
+	return total
+}
 
-	if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
-		return fmt.Errorf("create output directory: %w", err)
+// writeArchive creates the compressed archive file
+func (c *Compressor) writeArchive(entries []Entry, output string, archiveType ArchiveType, rootName string) error {
+	if err := c.prepareOutputPath(output); err != nil {
+		return err
 	}
 
 	f, err := os.Create(output)
@@ -102,87 +128,134 @@ func compressFiles(entries []Entry, output string, archiveType ArchiveType, root
 	}
 	defer f.Close()
 
-	// Write header
-	if err := writeArchiveHeader(f, archiveType, rootName, entries); err != nil {
+	if err := c.writeHeader(f, archiveType, rootName, len(entries)); err != nil {
 		return err
 	}
 
-	// Write metadata placeholders
-	entryOffsets := make([]int64, len(entries))
-	for i, entry := range entries {
-		entryOffsets[i], err = f.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return fmt.Errorf("seek for entry %d: %w", i, err)
+	entryOffsets, err := c.writePlaceholders(f, entries)
+	if err != nil {
+		return err
+	}
+
+	return c.compressEntries(f, entries, entryOffsets)
+}
+
+// prepareOutputPath ensures the output path is ready for writing
+func (c *Compressor) prepareOutputPath(output string) error {
+	if _, err := os.Stat(output); err == nil {
+		if err := os.Remove(output); err != nil {
+			return fmt.Errorf("remove existing output: %w", err)
 		}
-		placeholderSize := 2 + len(entry.RelPath) + 8 + 8 // relPathLen + relPath + sizes
-		if _, err = f.Write(make([]byte, placeholderSize)); err != nil {
-			return fmt.Errorf("write placeholder %d: %w", i, err)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check output existence: %w", err)
+	}
+
+	dir := filepath.Dir(output)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("create output directory: %w", err)
 		}
 	}
 
-	// Compress and update metadata
+	return nil
+}
+
+// writeHeader writes the archive header
+func (c *Compressor) writeHeader(w io.Writer, archiveType ArchiveType, rootName string, entryCount int) error {
+	// Magic number
+	if _, err := w.Write([]byte(Magic)); err != nil {
+		return fmt.Errorf("write magic: %w", err)
+	}
+
+	// Version
+	if err := binary.Write(w, binary.BigEndian, Version); err != nil {
+		return fmt.Errorf("write version: %w", err)
+	}
+
+	// Archive type
+	if err := binary.Write(w, binary.BigEndian, archiveType); err != nil {
+		return fmt.Errorf("write archive type: %w", err)
+	}
+
+	// Root name
+	rootNameBytes := []byte(rootName)
+	if err := binary.Write(w, binary.BigEndian, uint16(len(rootNameBytes))); err != nil {
+		return fmt.Errorf("write root name length: %w", err)
+	}
+	if _, err := w.Write(rootNameBytes); err != nil {
+		return fmt.Errorf("write root name: %w", err)
+	}
+
+	// Entry count
+	if err := binary.Write(w, binary.BigEndian, uint32(entryCount)); err != nil {
+		return fmt.Errorf("write entry count: %w", err)
+	}
+
+	return nil
+}
+
+// writePlaceholders reserves space for entry metadata
+func (c *Compressor) writePlaceholders(f *os.File, entries []Entry) ([]int64, error) {
+	offsets := make([]int64, len(entries))
+
+	for i, entry := range entries {
+		offset, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, fmt.Errorf("seek for entry %d: %w", i, err)
+		}
+		offsets[i] = offset
+
+		// Placeholder: relPathLen(2) + relPath + originalSize(8) + compressedSize(8)
+		placeholderSize := 2 + len(entry.RelPath) + 16
+		if _, err := f.Write(make([]byte, placeholderSize)); err != nil {
+			return nil, fmt.Errorf("write placeholder %d: %w", i, err)
+		}
+	}
+
+	return offsets, nil
+}
+
+// compressEntries compresses each entry and updates metadata
+func (c *Compressor) compressEntries(f *os.File, entries []Entry, offsets []int64) error {
 	for i, entry := range entries {
 		startPos, err := f.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return fmt.Errorf("seek start for %s: %w", entry.FilePath, err)
 		}
-		originalSize, err := compressFileStreaming(entry.FilePath, f)
+
+		originalSize, err := c.compressFile(entry.FilePath, f)
 		if err != nil {
 			return fmt.Errorf("compress %s: %w", entry.FilePath, err)
 		}
+
 		endPos, err := f.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return fmt.Errorf("seek end for %s: %w", entry.FilePath, err)
 		}
+
 		compressedSize := uint64(endPos - startPos)
 
-		// Update metadata
-		if err := updateEntryMetadata(f, entryOffsets[i], entry.RelPath, originalSize, compressedSize); err != nil {
+		if err := c.updateMetadata(f, offsets[i], entry.RelPath, originalSize, compressedSize); err != nil {
 			return err
 		}
 
-		if _, err = f.Seek(endPos, io.SeekStart); err != nil {
-			return fmt.Errorf("seek back %d: %w", i, err)
+		if _, err := f.Seek(endPos, io.SeekStart); err != nil {
+			return fmt.Errorf("seek after metadata update: %w", err)
 		}
 	}
-	return nil
-}
-
-// writeArchiveHeader writes the archive header to the output file
-func writeArchiveHeader(f *os.File, archiveType ArchiveType, rootName string, entries []Entry) error {
-	if _, err := f.Write([]byte(Magic)); err != nil {
-		return fmt.Errorf("write magic: %w", err)
-	}
-	if err := binary.Write(f, binary.BigEndian, uint8(Version)); err != nil {
-		return fmt.Errorf("write version: %w", err)
-	}
-	if err := binary.Write(f, binary.BigEndian, archiveType); err != nil {
-		return fmt.Errorf("write archive type: %w", err)
-	}
-
-	rootNameBytes := []byte(rootName)
-	if err := binary.Write(f, binary.BigEndian, uint16(len(rootNameBytes))); err != nil {
-		return fmt.Errorf("write root name length: %w", err)
-	}
-	if _, err := f.Write(rootNameBytes); err != nil {
-		return fmt.Errorf("write root name: %w", err)
-	}
-	if err := binary.Write(f, binary.BigEndian, uint32(len(entries))); err != nil {
-		return fmt.Errorf("write number of entries: %w", err)
-	}
 
 	return nil
 }
 
-// updateEntryMetadata updates the metadata for an entry in the archive
-func updateEntryMetadata(f *os.File, offset int64, relPath string, originalSize, compressedSize uint64) error {
+// updateMetadata writes the actual metadata for an entry
+func (c *Compressor) updateMetadata(f *os.File, offset int64, relPath string, originalSize, compressedSize uint64) error {
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek metadata: %w", err)
+		return fmt.Errorf("seek to metadata: %w", err)
 	}
 
 	relPathBytes := []byte(relPath)
 	if err := binary.Write(f, binary.BigEndian, uint16(len(relPathBytes))); err != nil {
-		return fmt.Errorf("write relPathLen: %w", err)
+		return fmt.Errorf("write relPath length: %w", err)
 	}
 	if _, err := f.Write(relPathBytes); err != nil {
 		return fmt.Errorf("write relPath: %w", err)
@@ -197,44 +270,50 @@ func updateEntryMetadata(f *os.File, offset int64, relPath string, originalSize,
 	return nil
 }
 
-// compressFileStreaming compresses a file in chunks
-func compressFileStreaming(filePath string, w io.Writer) (uint64, error) {
+// compressFile compresses a single file using LZ4 streaming
+func (c *Compressor) compressFile(filePath string, w io.Writer) (uint64, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return 0, fmt.Errorf("open %s: %w", filePath, err)
+		return 0, fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("stat file: %w", err)
+	}
+
+	if info.Size() == 0 {
+		return 0, nil
+	}
 
 	zw := lz4.NewWriter(w)
 	defer zw.Close()
 
-	info, err := f.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("stat %s: %w", filePath, err)
-	}
+	buf := c.bufferPool.Get()
+	defer c.bufferPool.Put(buf)
 
-	if info.Size() == 0 {
-		return 0, nil // Empty file, no data written
-	}
-
-	buf := make([]byte, 32*1024)
 	var totalBytes uint64
 	for {
-		n, err := f.Read(buf)
+		n, err := f.Read(*buf)
 		if err != nil && err != io.EOF {
-			return 0, fmt.Errorf("read %s: %w", filePath, err)
+			return 0, fmt.Errorf("read file: %w", err)
 		}
 		if n == 0 {
 			break
 		}
-		if _, err = zw.Write(buf[:n]); err != nil {
-			return 0, fmt.Errorf("write compressed %s: %w", filePath, err)
+
+		if _, err := zw.Write((*buf)[:n]); err != nil {
+			return 0, fmt.Errorf("write compressed data: %w", err)
 		}
+
 		totalBytes += uint64(n)
 		progress.AddBytes(uint64(n))
 	}
+
 	if err := zw.Close(); err != nil {
-		return 0, fmt.Errorf("close LZ4 writer %s: %w", filePath, err)
+		return 0, fmt.Errorf("close LZ4 writer: %w", err)
 	}
+
 	return totalBytes, nil
 }

@@ -15,114 +15,141 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
-// Decompress handles the decompression process
+// Decompressor handles archive extraction
+type Decompressor struct {
+	bufferPool  *BufferPool
+	concurrency int
+}
+
+// NewDecompressor creates a new Decompressor with default settings
+func NewDecompressor() *Decompressor {
+	return &Decompressor{
+		bufferPool:  defaultBufferPool,
+		concurrency: runtime.NumCPU(),
+	}
+}
+
+// Decompress extracts an archive to the specified destination
 func Decompress(input, decompressedName string) error {
+	return NewDecompressor().Decompress(input, decompressedName)
+}
+
+// Decompress performs the extraction operation
+func (d *Decompressor) Decompress(input, destName string) error {
 	f, err := os.Open(input)
 	if err != nil {
 		return fmt.Errorf("open input: %w", err)
 	}
 	defer f.Close()
 
-	// Read and validate archive header
-	tasks, startOffset, outputDir, archiveType, err := readArchiveHeader(f, decompressedName)
+	header, tasks, dataOffset, err := d.parseArchive(f, destName)
 	if err != nil {
 		return err
 	}
 
-	// Calculate total size for progress tracking
-	var totalSize uint64
-	for _, task := range tasks {
-		totalSize += task.OriginalSize
-	}
-	if totalSize == 0 {
-		totalSize = 1
-	}
+	totalSize := d.calculateTotalSize(tasks)
 	progress.Init(totalSize)
 	defer progress.Stop()
 
-	return decompressFiles(input, startOffset, tasks, archiveType, outputDir)
+	outputDir := d.resolveOutputDir(header, destName)
+
+	return d.extractFiles(input, dataOffset, tasks, header.Type, outputDir)
 }
 
-// readArchiveHeader reads and validates the archive header
-func readArchiveHeader(f *os.File, decompressedName string) ([]DecompressTask, int64, string, ArchiveType, error) {
+// parseArchive reads the archive header and builds extraction tasks
+func (d *Decompressor) parseArchive(f *os.File, destName string) (*ArchiveHeader, []DecompressTask, int64, error) {
 	br := bufio.NewReader(f)
 
-	// Read magic number
-	var magicBytes [4]byte
-	if _, err := io.ReadFull(br, magicBytes[:]); err != nil {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("read magic: %w", err)
-	}
-	if string(magicBytes[:]) != Magic {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("invalid magic number: %q", string(magicBytes[:]))
+	header, err := d.readHeader(br)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 
-	// Read version
-	var versionByte uint8
-	if err := binary.Read(br, binary.BigEndian, &versionByte); err != nil {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("read version: %w", err)
-	}
-	if versionByte != Version {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("unsupported version: %d", versionByte)
+	outputDir := d.resolveOutputDir(header, destName)
+	tasks, err := d.readEntries(br, header, outputDir, f.Name(), destName)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 
-	// Read archive type
-	var archiveType ArchiveType
-	if err := binary.Read(br, binary.BigEndian, &archiveType); err != nil {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("read archive type: %w", err)
+	// Calculate data start offset
+	filePos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("seek current: %w", err)
+	}
+	dataOffset := filePos - int64(br.Buffered())
+
+	return header, tasks, dataOffset, nil
+}
+
+// readHeader reads and validates the archive header
+func (d *Decompressor) readHeader(br *bufio.Reader) (*ArchiveHeader, error) {
+	header := &ArchiveHeader{}
+
+	// Magic number
+	if _, err := io.ReadFull(br, header.Magic[:]); err != nil {
+		return nil, fmt.Errorf("read magic: %w", err)
+	}
+	if string(header.Magic[:]) != Magic {
+		return nil, fmt.Errorf("invalid magic number: %q", string(header.Magic[:]))
 	}
 
-	// Read root name
+	// Version
+	if err := binary.Read(br, binary.BigEndian, &header.Version); err != nil {
+		return nil, fmt.Errorf("read version: %w", err)
+	}
+	if header.Version != Version {
+		return nil, fmt.Errorf("unsupported version: %d", header.Version)
+	}
+
+	// Archive type
+	if err := binary.Read(br, binary.BigEndian, &header.Type); err != nil {
+		return nil, fmt.Errorf("read archive type: %w", err)
+	}
+
+	// Root name
 	var rootNameLen uint16
 	if err := binary.Read(br, binary.BigEndian, &rootNameLen); err != nil {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("read root name length: %w", err)
+		return nil, fmt.Errorf("read root name length: %w", err)
 	}
 	rootNameBytes := make([]byte, rootNameLen)
 	if _, err := io.ReadFull(br, rootNameBytes); err != nil {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("read root name: %w", err)
+		return nil, fmt.Errorf("read root name: %w", err)
 	}
-	rootName := string(rootNameBytes)
+	header.RootName = string(rootNameBytes)
 
-	// Decide the top-level output path.
-	// Directory archives: default to the original root folder name.
-	// Single-file archives: default to current directory; a provided name is treated as the full output file path.
-	var outputDir string
-	if decompressedName != "" {
-		outputDir = decompressedName
-	} else if archiveType == ArchiveDir {
-		outputDir = rootName
-	} else {
-		outputDir = "."
+	// Entry count
+	if err := binary.Read(br, binary.BigEndian, &header.EntryCount); err != nil {
+		return nil, fmt.Errorf("read entry count: %w", err)
 	}
 
-	// Read number of entries
-	var numEntries uint32
-	if err := binary.Read(br, binary.BigEndian, &numEntries); err != nil {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("read num entries: %w", err)
-	}
+	return header, nil
+}
 
-	// Read metadata for each entry
-	tasks := make([]DecompressTask, numEntries)
-	for i := 0; i < int(numEntries); i++ {
+// readEntries reads metadata for all entries in the archive
+func (d *Decompressor) readEntries(br *bufio.Reader, header *ArchiveHeader, outputDir, inputPath, destName string) ([]DecompressTask, error) {
+	tasks := make([]DecompressTask, header.EntryCount)
+
+	for i := uint32(0); i < header.EntryCount; i++ {
 		var relPathLen uint16
 		if err := binary.Read(br, binary.BigEndian, &relPathLen); err != nil {
-			return nil, 0, "", ArchiveDir, fmt.Errorf("read relPathLen %d: %w", i, err)
+			return nil, fmt.Errorf("read relPath length %d: %w", i, err)
 		}
+
 		relPathBytes := make([]byte, relPathLen)
 		if _, err := io.ReadFull(br, relPathBytes); err != nil {
-			return nil, 0, "", ArchiveDir, fmt.Errorf("read relPath %d: %w", i, err)
+			return nil, fmt.Errorf("read relPath %d: %w", i, err)
 		}
 		relPath := string(relPathBytes)
 
 		var originalSize, compressedSize uint64
 		if err := binary.Read(br, binary.BigEndian, &originalSize); err != nil {
-			return nil, 0, "", ArchiveDir, fmt.Errorf("read originalSize %d: %w", i, err)
+			return nil, fmt.Errorf("read originalSize %d: %w", i, err)
 		}
 		if err := binary.Read(br, binary.BigEndian, &compressedSize); err != nil {
-			return nil, 0, "", ArchiveDir, fmt.Errorf("read compressedSize %d: %w", i, err)
+			return nil, fmt.Errorf("read compressedSize %d: %w", i, err)
 		}
 
-		// Determine destination path
-		destPath := determineDestPath(archiveType, outputDir, relPath, rootName, f.Name(), decompressedName)
+		destPath := d.resolveDestPath(header.Type, outputDir, relPath, header.RootName, inputPath, destName)
 
 		tasks[i] = DecompressTask{
 			RelPath:        relPath,
@@ -132,161 +159,203 @@ func readArchiveHeader(f *os.File, decompressedName string) ([]DecompressTask, i
 		}
 	}
 
-	// Calculate start offset for compressed data
-	offset, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, 0, "", ArchiveDir, fmt.Errorf("seek current: %w", err)
-	}
-	buffered := br.Buffered()
-	startOffset := offset - int64(buffered)
-
-	return tasks, startOffset, outputDir, archiveType, nil
+	return tasks, nil
 }
 
-// determineDestPath decides where an extracted entry should be written.
-//
-//	archiveType      – whether the archive represents a directory or a single file
-//	baseOutputDir    – resolved top-level output directory (root folder for directory archives or "." for file archives)
-//	relPath          – relative path stored in the archive entry metadata
-//	rootName         – name of the root directory or file recorded in the header
-//	inputPath        – path of the .agcp archive on disk (used only for fallback names)
-//	userOutputName   – raw value provided by the user on the CLI (may be empty)
-func determineDestPath(archiveType ArchiveType, baseOutputDir, relPath, rootName, inputPath, userOutputName string) string {
+// resolveOutputDir determines the base output directory
+func (d *Decompressor) resolveOutputDir(header *ArchiveHeader, destName string) string {
+	if destName != "" {
+		return destName
+	}
+	if header.Type == ArchiveDir {
+		return header.RootName
+	}
+	return "."
+}
+
+// resolveDestPath determines the destination path for a single entry
+func (d *Decompressor) resolveDestPath(archiveType ArchiveType, outputDir, relPath, rootName, inputPath, userOutput string) string {
 	switch archiveType {
 	case ArchiveDir:
-		// Always preserve structure inside the chosen base directory.
-		return filepath.Join(baseOutputDir, relPath)
+		return filepath.Join(outputDir, relPath)
 
 	case ArchiveFile:
-		if userOutputName != "" {
-			// If destination exists and is a directory, place the file inside it.
-			if info, err := os.Stat(userOutputName); err == nil && info.IsDir() {
-				// Use provided directory but preserve original/root filename.
-				if relPath == "" {
-					return filepath.Join(userOutputName, rootName)
-				}
-				return filepath.Join(userOutputName, relPath)
-			}
+		return d.resolveFileDestPath(outputDir, relPath, rootName, inputPath, userOutput)
 
-			// If relPath is non-empty treat userOutputName as base dir to preserve structure.
-			if relPath != "" {
-				return filepath.Join(userOutputName, relPath)
-			}
-
-			// Otherwise treat it as the exact file path the user wants.
-			return userOutputName
-		}
-
-		if relPath != "" {
-			return filepath.Join(baseOutputDir, relPath)
-		}
-
-		// Generate filename from header or archive filename.
-		fileName := rootName
-		if fileName == "" {
-			fileName = filepath.Base(inputPath)
-			if ext := filepath.Ext(fileName); ext == ".agcp" {
-				fileName = fileName[:len(fileName)-len(ext)]
-			}
-		}
-		return filepath.Join(baseOutputDir, fileName)
+	default:
+		return ""
 	}
-	return ""
 }
 
-// decompressFiles decompresses files concurrently
-func decompressFiles(archivePath string, startOffset int64, tasks []DecompressTask, archiveType ArchiveType, baseOutput string) error {
-	// Calculate offsets for each compressed file in the archive
-	offsets := make([]int64, len(tasks))
-	currentOffset := startOffset
-	for i, task := range tasks {
-		offsets[i] = currentOffset
-		currentOffset += int64(task.CompressedSize)
+// resolveFileDestPath handles the complex logic for single-file archive destinations
+func (d *Decompressor) resolveFileDestPath(outputDir, relPath, rootName, inputPath, userOutput string) string {
+	if userOutput != "" {
+		// Check if destination is an existing directory
+		if info, err := os.Stat(userOutput); err == nil && info.IsDir() {
+			if relPath == "" {
+				return filepath.Join(userOutput, rootName)
+			}
+			return filepath.Join(userOutput, relPath)
+		}
+
+		// Non-empty relPath: treat as base directory
+		if relPath != "" {
+			return filepath.Join(userOutput, relPath)
+		}
+
+		// Use as exact file path
+		return userOutput
 	}
 
-	// For directory archives ensure the top-level directory exists.
+	if relPath != "" {
+		return filepath.Join(outputDir, relPath)
+	}
+
+	// Generate filename from header or archive name
+	fileName := rootName
+	if fileName == "" {
+		fileName = filepath.Base(inputPath)
+		if ext := filepath.Ext(fileName); ext == ".agcp" {
+			fileName = fileName[:len(fileName)-len(ext)]
+		}
+	}
+	return filepath.Join(outputDir, fileName)
+}
+
+// calculateTotalSize computes the total uncompressed size
+func (d *Decompressor) calculateTotalSize(tasks []DecompressTask) uint64 {
+	var total uint64
+	for i := range tasks {
+		total += tasks[i].OriginalSize
+	}
+	if total == 0 {
+		total = 1
+	}
+	return total
+}
+
+// extractFiles decompresses all files concurrently
+func (d *Decompressor) extractFiles(archivePath string, dataOffset int64, tasks []DecompressTask, archiveType ArchiveType, outputDir string) error {
+	// Compute offsets for each entry
+	d.computeOffsets(tasks, dataOffset)
+
+	// Create all required directories
+	if err := d.createDirectories(tasks, archiveType, outputDir); err != nil {
+		return err
+	}
+
+	return d.extractConcurrently(archivePath, tasks)
+}
+
+// computeOffsets calculates the file offset for each entry
+func (d *Decompressor) computeOffsets(tasks []DecompressTask, startOffset int64) {
+	offset := startOffset
+	for i := range tasks {
+		tasks[i].Offset = offset
+		offset += int64(tasks[i].CompressedSize)
+	}
+}
+
+// createDirectories creates all necessary output directories
+func (d *Decompressor) createDirectories(tasks []DecompressTask, archiveType ArchiveType, outputDir string) error {
+	// For directory archives, create the root directory
 	if archiveType == ArchiveDir {
-		if err := os.MkdirAll(baseOutput, 0755); err != nil {
-			return fmt.Errorf("create root dir %s: %w", baseOutput, err)
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			return fmt.Errorf("create root dir %s: %w", outputDir, err)
 		}
 	}
 
-	// Pre-create directories for all files
-	for _, task := range tasks {
-		if err := os.MkdirAll(filepath.Dir(task.DestPath), 0755); err != nil {
-			return fmt.Errorf("create dir for %s: %w", task.DestPath, err)
+	// Collect unique directories to avoid redundant calls
+	dirs := make(map[string]struct{})
+	for i := range tasks {
+		dir := filepath.Dir(tasks[i].DestPath)
+		if dir != "" && dir != "." {
+			dirs[dir] = struct{}{}
 		}
 	}
 
-	// Use a semaphore to limit concurrent goroutines
-	sem := make(chan struct{}, runtime.NumCPU())
+	// Create all directories
+	for dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("create directory %s: %w", dir, err)
+		}
+	}
+
+	return nil
+}
+
+// extractConcurrently extracts files using a worker pool
+func (d *Decompressor) extractConcurrently(archivePath string, tasks []DecompressTask) error {
+	sem := make(chan struct{}, d.concurrency)
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(tasks))
 
-	// Decompress files concurrently
-	for i, task := range tasks {
+	for i := range tasks {
 		wg.Add(1)
-		go func(task DecompressTask, offset int64) {
+		go func(task *DecompressTask) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			f, err := os.Open(archivePath)
-			if err != nil {
-				errCh <- fmt.Errorf("open archive for %s: %w", task.DestPath, err)
-				return
-			}
-			defer f.Close()
-
-			sr := io.NewSectionReader(f, offset, int64(task.CompressedSize))
-			if err := decompressFileStreaming(sr, task); err != nil {
+			if err := d.extractFile(archivePath, task); err != nil {
 				errCh <- err
-				return
 			}
-		}(task, offsets[i])
+		}(&tasks[i])
 	}
+
 	wg.Wait()
 	close(errCh)
 
 	// Return first error if any
-	if len(errCh) > 0 {
-		return <-errCh
+	for err := range errCh {
+		return err
 	}
+
 	return nil
 }
 
-// decompressFileStreaming decompresses a file in chunks
-func decompressFileStreaming(r io.Reader, task DecompressTask) error {
-	// Ensure parent directory exists
-	if err := os.MkdirAll(filepath.Dir(task.DestPath), 0755); err != nil {
-		return fmt.Errorf("create parent dir for %s: %w", task.DestPath, err)
-	}
-
+// extractFile extracts a single file from the archive
+func (d *Decompressor) extractFile(archivePath string, task *DecompressTask) error {
 	// Handle empty files
 	if task.OriginalSize == 0 {
 		f, err := os.Create(task.DestPath)
 		if err != nil {
-			return fmt.Errorf("create empty %s: %w", task.DestPath, err)
+			return fmt.Errorf("create empty file %s: %w", task.DestPath, err)
 		}
 		return f.Close()
 	}
 
-	// Create output file
+	archive, err := os.Open(archivePath)
+	if err != nil {
+		return fmt.Errorf("open archive: %w", err)
+	}
+	defer archive.Close()
+
+	// Create section reader for this entry's data
+	sr := io.NewSectionReader(archive, task.Offset, int64(task.CompressedSize))
+
+	return d.decompressToFile(sr, task)
+}
+
+// decompressToFile writes decompressed data to the destination file
+func (d *Decompressor) decompressToFile(r io.Reader, task *DecompressTask) error {
 	f, err := os.Create(task.DestPath)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", task.DestPath, err)
+		return fmt.Errorf("create file %s: %w", task.DestPath, err)
 	}
 	defer f.Close()
 
-	// Decompress
 	zr := lz4.NewReader(r)
 	pw := &progress.Writer{W: f}
+
 	n, err := io.CopyN(pw, zr, int64(task.OriginalSize))
 	if err != nil && err != io.EOF {
-		return fmt.Errorf("copy %s: %w", task.DestPath, err)
+		return fmt.Errorf("decompress %s: %w", task.DestPath, err)
 	}
+
 	if uint64(n) != task.OriginalSize {
-		return fmt.Errorf("copy %s: expected %d bytes, got %d", task.DestPath, task.OriginalSize, n)
+		return fmt.Errorf("size mismatch for %s: expected %d, got %d", task.DestPath, task.OriginalSize, n)
 	}
+
 	return nil
 }

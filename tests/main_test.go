@@ -387,7 +387,7 @@ func TestArchiveMetadata(t *testing.T) {
 		Error(fmt.Sprintf("Failed to read version: %v", err))
 		t.Fatalf("Failed to read version: %v", err)
 	}
-	if int(versionByte) != Version {
+	if versionByte != Version {
 		Error(fmt.Sprintf("Invalid version: expected %d, got %d", Version, versionByte))
 		t.Fatalf("Invalid version: expected %d, got %d", Version, versionByte)
 	}
