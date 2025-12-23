@@ -11,8 +11,6 @@ import (
 	"sync"
 
 	"agcp/pkg/progress"
-
-	"github.com/pierrec/lz4/v4"
 )
 
 // Decompressor handles archive extraction
@@ -24,7 +22,7 @@ type Decompressor struct {
 // NewDecompressor creates a new Decompressor with default settings
 func NewDecompressor() *Decompressor {
 	return &Decompressor{
-		bufferPool:  defaultBufferPool,
+		bufferPool:  largeBufferPool, // Use larger buffers for better throughput
 		concurrency: runtime.NumCPU(),
 	}
 }
@@ -58,7 +56,7 @@ func (d *Decompressor) Decompress(input, destName string) error {
 
 // parseArchive reads the archive header and builds extraction tasks
 func (d *Decompressor) parseArchive(f *os.File, destName string) (*ArchiveHeader, []DecompressTask, int64, error) {
-	br := bufio.NewReader(f)
+	br := bufio.NewReaderSize(f, 8192)
 
 	header, err := d.readHeader(br)
 	if err != nil {
@@ -266,7 +264,7 @@ func (d *Decompressor) createDirectories(tasks []DecompressTask, archiveType Arc
 	}
 
 	// Collect unique directories to avoid redundant calls
-	dirs := make(map[string]struct{})
+	dirs := make(map[string]struct{}, len(tasks))
 	for i := range tasks {
 		dir := filepath.Dir(tasks[i].DestPath)
 		if dir != "" && dir != "." {
@@ -345,16 +343,39 @@ func (d *Decompressor) decompressToFile(r io.Reader, task *DecompressTask) error
 	}
 	defer f.Close()
 
-	zr := lz4.NewReader(r)
-	pw := &progress.Writer{W: f}
+	// Use buffered writer for better I/O performance
+	bw := getBufWriter(f)
 
-	n, err := io.CopyN(pw, zr, int64(task.OriginalSize))
+	// Get pooled LZ4 reader
+	zr := getLZ4Reader(r)
+
+	// Get buffer from pool for copying
+	buf := d.bufferPool.Get()
+
+	// Create progress tracking writer
+	pw := &progress.Writer{W: bw}
+
+	// Copy with size limit using pooled buffer
+	written, err := copyBufferN(pw, zr, int64(task.OriginalSize), *buf)
+
+	// Return buffer to pool
+	d.bufferPool.Put(buf)
+
+	// Return LZ4 reader to pool
+	putLZ4Reader(zr)
+
+	// Flush and return buffered writer
+	if flushErr := bw.Flush(); flushErr != nil && err == nil {
+		err = flushErr
+	}
+	putBufWriter(bw)
+
 	if err != nil && err != io.EOF {
 		return fmt.Errorf("decompress %s: %w", task.DestPath, err)
 	}
 
-	if uint64(n) != task.OriginalSize {
-		return fmt.Errorf("size mismatch for %s: expected %d, got %d", task.DestPath, task.OriginalSize, n)
+	if uint64(written) != task.OriginalSize {
+		return fmt.Errorf("size mismatch for %s: expected %d, got %d", task.DestPath, task.OriginalSize, written)
 	}
 
 	return nil

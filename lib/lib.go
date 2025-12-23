@@ -15,8 +15,11 @@ const (
 	// Version is the current archive format version
 	Version = core.Version
 
-	// DefaultBufferSize is the default chunk size for streaming operations
+	// DefaultBufferSize is the default chunk size for streaming operations (64 KB)
 	DefaultBufferSize = core.DefaultBufferSize
+
+	// LargeBufferSize is used for large file operations (256 KB)
+	LargeBufferSize = core.LargeBufferSize
 
 	// MaxPathLength is the maximum allowed path length in the archive
 	MaxPathLength = core.MaxPathLength

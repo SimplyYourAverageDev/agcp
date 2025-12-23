@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -8,8 +9,6 @@ import (
 	"path/filepath"
 
 	"agcp/pkg/progress"
-
-	"github.com/pierrec/lz4/v4"
 )
 
 // Compressor handles file and directory compression
@@ -20,7 +19,7 @@ type Compressor struct {
 // NewCompressor creates a new Compressor with default settings
 func NewCompressor() *Compressor {
 	return &Compressor{
-		bufferPool: defaultBufferPool,
+		bufferPool: largeBufferPool, // Use larger buffers for better throughput
 	}
 }
 
@@ -71,7 +70,8 @@ func (c *Compressor) collectEntries(input string, info os.FileInfo) (ArchiveType
 
 // walkDirectory recursively collects all files in a directory
 func (c *Compressor) walkDirectory(root string) ([]Entry, error) {
-	var entries []Entry
+	// Pre-allocate with estimated capacity
+	entries := make([]Entry, 0, 64)
 
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -111,7 +111,7 @@ func (c *Compressor) calculateTotalSize(entries []Entry) uint64 {
 		}
 	}
 	if total == 0 {
-		total = 1 // Avoid division by zero in progress
+		total = 1
 	}
 	return total
 }
@@ -128,8 +128,20 @@ func (c *Compressor) writeArchive(entries []Entry, output string, archiveType Ar
 	}
 	defer f.Close()
 
-	if err := c.writeHeader(f, archiveType, rootName, len(entries)); err != nil {
+	// Use buffered writer for better I/O performance
+	bw := getBufWriter(f)
+	defer func() {
+		bw.Flush()
+		putBufWriter(bw)
+	}()
+
+	if err := c.writeHeader(bw, archiveType, rootName, len(entries)); err != nil {
 		return err
+	}
+
+	// Flush buffered writer before seeking
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("flush header: %w", err)
 	}
 
 	entryOffsets, err := c.writePlaceholders(f, entries)
@@ -198,6 +210,10 @@ func (c *Compressor) writeHeader(w io.Writer, archiveType ArchiveType, rootName 
 func (c *Compressor) writePlaceholders(f *os.File, entries []Entry) ([]int64, error) {
 	offsets := make([]int64, len(entries))
 
+	// Reuse a single zero buffer for placeholders
+	maxPlaceholderSize := 2 + MaxPathLength + 16
+	zeroBuf := make([]byte, maxPlaceholderSize)
+
 	for i, entry := range entries {
 		offset, err := f.Seek(0, io.SeekCurrent)
 		if err != nil {
@@ -207,7 +223,7 @@ func (c *Compressor) writePlaceholders(f *os.File, entries []Entry) ([]int64, er
 
 		// Placeholder: relPathLen(2) + relPath + originalSize(8) + compressedSize(8)
 		placeholderSize := 2 + len(entry.RelPath) + 16
-		if _, err := f.Write(make([]byte, placeholderSize)); err != nil {
+		if _, err := f.Write(zeroBuf[:placeholderSize]); err != nil {
 			return nil, fmt.Errorf("write placeholder %d: %w", i, err)
 		}
 	}
@@ -270,7 +286,7 @@ func (c *Compressor) updateMetadata(f *os.File, offset int64, relPath string, or
 	return nil
 }
 
-// compressFile compresses a single file using LZ4 streaming
+// compressFile compresses a single file using pooled LZ4 writer
 func (c *Compressor) compressFile(filePath string, w io.Writer) (uint64, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -287,33 +303,46 @@ func (c *Compressor) compressFile(filePath string, w io.Writer) (uint64, error) 
 		return 0, nil
 	}
 
-	zw := lz4.NewWriter(w)
-	defer zw.Close()
+	// Use buffered reader for input file
+	br := bufio.NewReaderSize(f, 32*1024)
 
+	// Get pooled LZ4 writer
+	zw := getLZ4Writer(w)
+
+	// Get buffer from pool
 	buf := c.bufferPool.Get()
-	defer c.bufferPool.Put(buf)
 
 	var totalBytes uint64
 	for {
-		n, err := f.Read(*buf)
-		if err != nil && err != io.EOF {
-			return 0, fmt.Errorf("read file: %w", err)
+		n, err := br.Read(*buf)
+		if n > 0 {
+			if _, werr := zw.Write((*buf)[:n]); werr != nil {
+				c.bufferPool.Put(buf)
+				putLZ4Writer(zw)
+				return 0, fmt.Errorf("write compressed data: %w", werr)
+			}
+			totalBytes += uint64(n)
+			progress.AddBytes(uint64(n))
 		}
-		if n == 0 {
+		if err == io.EOF {
 			break
 		}
-
-		if _, err := zw.Write((*buf)[:n]); err != nil {
-			return 0, fmt.Errorf("write compressed data: %w", err)
+		if err != nil {
+			c.bufferPool.Put(buf)
+			putLZ4Writer(zw)
+			return 0, fmt.Errorf("read file: %w", err)
 		}
-
-		totalBytes += uint64(n)
-		progress.AddBytes(uint64(n))
 	}
 
+	// Return buffer to pool
+	c.bufferPool.Put(buf)
+
+	// Close and return LZ4 writer to pool
 	if err := zw.Close(); err != nil {
+		putLZ4Writer(zw)
 		return 0, fmt.Errorf("close LZ4 writer: %w", err)
 	}
+	putLZ4Writer(zw)
 
 	return totalBytes, nil
 }

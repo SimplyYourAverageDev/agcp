@@ -1,7 +1,11 @@
 package core
 
 import (
+	"bufio"
+	"io"
 	"sync"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 // Archive format constants
@@ -12,8 +16,11 @@ const (
 	// Version is the current archive format version
 	Version uint8 = 1
 
-	// DefaultBufferSize is the default chunk size for streaming operations (32 KB)
-	DefaultBufferSize = 32 * 1024
+	// DefaultBufferSize is the default chunk size for streaming operations (64 KB)
+	DefaultBufferSize = 64 * 1024
+
+	// LargeBufferSize is used for large file operations (256 KB)
+	LargeBufferSize = 256 * 1024
 
 	// MaxPathLength is the maximum allowed path length in the archive
 	MaxPathLength = 4096
@@ -44,32 +51,44 @@ func (t ArchiveType) String() string {
 
 // Entry represents a file to be compressed with its paths
 type Entry struct {
-	// RelPath is the relative path within the archive
-	RelPath string
-
-	// FilePath is the absolute path on disk
-	FilePath string
-
-	// Size is the file size in bytes (cached for performance)
-	Size int64
+	RelPath  string // Relative path within the archive
+	FilePath string // Absolute path on disk
+	Size     int64  // File size in bytes (cached for performance)
 }
 
 // DecompressTask represents a file extraction job
 type DecompressTask struct {
-	// RelPath is the relative path within the archive
-	RelPath string
+	RelPath        string // Relative path within the archive
+	OriginalSize   uint64 // Uncompressed file size in bytes
+	CompressedSize uint64 // Compressed size in the archive
+	DestPath       string // Full destination path for extraction
+	Offset         int64  // Byte offset within the archive
+}
 
-	// OriginalSize is the uncompressed file size in bytes
-	OriginalSize uint64
+// ArchiveHeader contains metadata read from an archive
+type ArchiveHeader struct {
+	Magic      [4]byte     // 4-byte archive identifier
+	Version    uint8       // Format version number
+	Type       ArchiveType // File or directory archive
+	RootName   string      // Original name of the compressed file/directory
+	EntryCount uint32      // Number of files in the archive
+}
 
-	// CompressedSize is the compressed size in the archive
-	CompressedSize uint64
+// CompressionStats holds statistics about a compression operation
+type CompressionStats struct {
+	OriginalSize   uint64  // Total uncompressed size
+	CompressedSize uint64  // Total compressed size
+	FileCount      int     // Number of files processed
+	Ratio          float64 // Compression ratio as percentage
+}
 
-	// DestPath is the full destination path for extraction
-	DestPath string
-
-	// Offset is the byte offset within the archive where compressed data starts
-	Offset int64
+// CalculateRatio computes the compression ratio
+func (s *CompressionStats) CalculateRatio() float64 {
+	if s.OriginalSize == 0 {
+		return 0
+	}
+	s.Ratio = float64(s.CompressedSize) / float64(s.OriginalSize) * 100
+	return s.Ratio
 }
 
 // BufferPool provides reusable byte buffers to reduce allocations
@@ -111,8 +130,32 @@ func (bp *BufferPool) Size() int {
 	return bp.size
 }
 
-// Global buffer pool for default operations
-var defaultBufferPool = NewBufferPool(DefaultBufferSize)
+// Global pools for default operations
+var (
+	defaultBufferPool = NewBufferPool(DefaultBufferSize)
+	largeBufferPool   = NewBufferPool(LargeBufferSize)
+
+	// Buffered writer pool (8KB buffer for filesystem efficiency)
+	bufWriterPool = sync.Pool{
+		New: func() interface{} {
+			return bufio.NewWriterSize(nil, 8192)
+		},
+	}
+
+	// LZ4 writer pool - reuse LZ4 writers to avoid allocation
+	lz4WriterPool = sync.Pool{
+		New: func() interface{} {
+			return lz4.NewWriter(nil)
+		},
+	}
+
+	// LZ4 reader pool - reuse LZ4 readers to avoid allocation
+	lz4ReaderPool = sync.Pool{
+		New: func() interface{} {
+			return lz4.NewReader(nil)
+		},
+	}
+)
 
 // GetBuffer retrieves a buffer from the default pool
 func GetBuffer() *[]byte {
@@ -124,44 +167,57 @@ func PutBuffer(buf *[]byte) {
 	defaultBufferPool.Put(buf)
 }
 
-// ArchiveHeader contains metadata read from an archive
-type ArchiveHeader struct {
-	// Magic is the 4-byte archive identifier
-	Magic [4]byte
-
-	// Version is the format version number
-	Version uint8
-
-	// Type indicates whether this is a file or directory archive
-	Type ArchiveType
-
-	// RootName is the original name of the compressed file or directory
-	RootName string
-
-	// EntryCount is the number of files in the archive
-	EntryCount uint32
+// GetLargeBuffer retrieves a buffer from the large buffer pool
+func GetLargeBuffer() *[]byte {
+	return largeBufferPool.Get()
 }
 
-// CompressionStats holds statistics about a compression operation
-type CompressionStats struct {
-	// OriginalSize is the total uncompressed size
-	OriginalSize uint64
-
-	// CompressedSize is the total compressed size
-	CompressedSize uint64
-
-	// FileCount is the number of files processed
-	FileCount int
-
-	// Ratio returns the compression ratio as a percentage
-	Ratio float64
+// PutLargeBuffer returns a buffer to the large buffer pool
+func PutLargeBuffer(buf *[]byte) {
+	largeBufferPool.Put(buf)
 }
 
-// CalculateRatio computes the compression ratio
-func (s *CompressionStats) CalculateRatio() float64 {
-	if s.OriginalSize == 0 {
-		return 0
-	}
-	s.Ratio = float64(s.CompressedSize) / float64(s.OriginalSize) * 100
-	return s.Ratio
+// getBufWriter gets a buffered writer from the pool
+func getBufWriter(w io.Writer) *bufio.Writer {
+	bw := bufWriterPool.Get().(*bufio.Writer)
+	bw.Reset(w)
+	return bw
+}
+
+// putBufWriter returns a buffered writer to the pool after flushing
+func putBufWriter(bw *bufio.Writer) {
+	bw.Reset(nil)
+	bufWriterPool.Put(bw)
+}
+
+// getLZ4Writer gets an LZ4 writer from the pool
+func getLZ4Writer(w io.Writer) *lz4.Writer {
+	zw := lz4WriterPool.Get().(*lz4.Writer)
+	zw.Reset(w)
+	return zw
+}
+
+// putLZ4Writer returns an LZ4 writer to the pool
+func putLZ4Writer(zw *lz4.Writer) {
+	zw.Reset(nil)
+	lz4WriterPool.Put(zw)
+}
+
+// getLZ4Reader gets an LZ4 reader from the pool
+func getLZ4Reader(r io.Reader) *lz4.Reader {
+	zr := lz4ReaderPool.Get().(*lz4.Reader)
+	zr.Reset(r)
+	return zr
+}
+
+// putLZ4Reader returns an LZ4 reader to the pool
+func putLZ4Reader(zr *lz4.Reader) {
+	zr.Reset(nil)
+	lz4ReaderPool.Put(zr)
+}
+
+// copyBufferN copies up to n bytes from src to dst using the provided buffer
+// Returns the number of bytes copied and any error
+func copyBufferN(dst io.Writer, src io.Reader, n int64, buf []byte) (int64, error) {
+	return io.CopyBuffer(dst, io.LimitReader(src, n), buf)
 }
